@@ -1393,37 +1393,30 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Custom prompt for review summaries - focuses on preserving actionable findings
+	// Custom prompt for review summaries. Keep this small because Pi returns it to the caller.
 	const REVIEW_SUMMARY_PROMPT = `We are leaving a code-review branch and returning to the main coding branch.
-Create a structured handoff that can be used immediately to implement fixes.
+Write a compact handoff for acting on the review. Keep it under 900 words unless there are many findings.
 
-You MUST summarize the review that happened in this branch so findings can be acted on.
-Do not omit findings: include every actionable issue that was identified.
+Include every actionable finding, but compress hard. Do not include review transcript, tool logs, code blocks, long rationale, or broad diff summaries.
 
-Required sections (in order):
+Use this exact format:
 
-## Review Scope
-- What was reviewed (files/paths, changes, and scope)
+## Review handoff
+Scope: <one sentence with what was reviewed>
+Verdict: correct | needs attention
 
-## Verdict
-- "correct" or "needs attention"
+## Fixes
+- [P0] path/to/file.ext:line - <short issue>; fix: <specific change>.
 
-## Findings
-For EACH finding, include:
-- Priority tag ([P0]..[P3]) and short title
-- File location (\`path/to/file.ext:line\`)
-- Why it matters (brief)
-- What should change (brief, actionable)
+If there are no actionable fixes, write "- (none)".
 
-## Fix Queue
-1. Ordered implementation checklist (highest priority first)
+## Constraints and preferences
+- <only constraints/preferences that affect the fix work>
 
-## Constraints & Preferences
-- Any constraints or preferences mentioned during review
-- Or "(none)"
+If none apply, write "- (none)".
 
-## Human Reviewer Callouts (Non-Blocking)
-Include only applicable callouts (no yes/no lines):
+## Human reviewer callouts
+Include only applicable non-blocking callouts. Keep each to one line.
 - **This change adds a database migration:** <files/details>
 - **This change introduces a new dependency:** <package(s)/details>
 - **This change changes a dependency (or the lockfile):** <files/package(s)/details>
@@ -1433,24 +1426,42 @@ Include only applicable callouts (no yes/no lines):
 
 If none apply, write "- (none)".
 
-These are informational callouts for humans and are not fix items by themselves.
+Use the original priority tag ([P0] through [P3]) for each fix. Preserve exact file paths, line numbers, function names, and error messages where available.`;
 
-Preserve exact file paths, function names, and error messages where available.`;
+	const REVIEW_FIX_ONLY_SUMMARY_PROMPT = `We are leaving a code-review branch and returning to the main coding branch.
+Return only the fix requests the coding agent should implement. This handoff must stay small.
+
+Use this exact format:
+
+## Review fix requests
+- [P0] path/to/file.ext:line - Change <what> because <short reason>.
+
+If there are no actionable fixes, write "- (none)".
+
+Rules:
+- Include every actionable finding, but keep each item under 35 words.
+- Do not include scope, verdict, human callouts, transcript, tool logs, code blocks, or general commentary.
+- Do not include non-blocking human callouts unless the review also made them explicit fix findings.
+- Use the original priority tag ([P0] through [P3]) for each fix.
+- Preserve exact paths, line numbers, function names, and error messages where available.`;
 
 	const REVIEW_FIX_FINDINGS_PROMPT = `Use the latest review summary in this session and implement the review findings now.
 
 Instructions:
-1. Treat the summary's Findings/Fix Queue as a checklist.
+1. Treat the summary's Fixes section as the checklist.
 2. Fix in priority order: P0, P1, then P2 (include P3 if quick and safe).
-3. If a finding is invalid/already fixed/not possible right now, briefly explain why and continue.
-4. Treat "Human Reviewer Callouts (Non-Blocking)" as informational only; do not convert them into fix tasks unless there is a separate explicit finding.
+3. If a finding is invalid, already fixed, or not possible right now, briefly explain why and continue.
+4. Treat human reviewer callouts as informational only unless there is a separate explicit finding.
 5. Follow fail-fast error handling: do not add local catch/fallback recovery unless this scope is an explicit boundary that can safely translate the failure.
 6. If you add or keep a \`try/catch\`, explain the expected failure mode and either rethrow with context or return a boundary-safe error response.
 7. JSON parsing/decoding should fail loudly by default; avoid silent fallback parsing.
 8. Run relevant tests/checks for touched code where practical.
 9. End with: fixed items, deferred/skipped items (with reasons), and verification results.`;
 
-	type EndReviewAction = "returnOnly" | "returnAndFix" | "returnAndSummarize";
+	const REVIEW_FIX_REQUESTS_PROMPT = `Implement the review fix requests in the handoff above.
+If there are no fix requests, say so and stop. Otherwise fix them in priority order, run relevant checks, and end with fixed items, skipped items with reasons, and verification results.`;
+
+	type EndReviewAction = "returnOnly" | "returnAndFix" | "returnAndFixOnly" | "returnAndSummarize";
 	type EndReviewActionResult = "ok" | "cancelled" | "error";
 	type EndReviewActionOptions = {
 		showSummaryLoader?: boolean;
@@ -1487,15 +1498,17 @@ Instructions:
 		ctx: ExtensionCommandContext,
 		originId: string,
 		showLoader: boolean,
+		customInstructions: string,
+		loaderText: string,
 	): Promise<{ cancelled: boolean; error?: string } | null> {
 		if (showLoader && ctx.hasUI) {
 			return ctx.ui.custom<{ cancelled: boolean; error?: string } | null>((tui, theme, _kb, done) => {
-				const loader = new BorderedLoader(tui, theme, "Returning and summarizing review branch...");
+				const loader = new BorderedLoader(tui, theme, loaderText);
 				loader.onAbort = () => done(null);
 
 				ctx.navigateTree(originId, {
 					summarize: true,
-					customInstructions: REVIEW_SUMMARY_PROMPT,
+					customInstructions,
 					replaceInstructions: true,
 				})
 					.then(done)
@@ -1508,7 +1521,7 @@ Instructions:
 		try {
 			return await ctx.navigateTree(originId, {
 				summarize: true,
-				customInstructions: REVIEW_SUMMARY_PROMPT,
+				customInstructions,
 				replaceInstructions: true,
 			});
 		} catch (error) {
@@ -1550,7 +1563,17 @@ Instructions:
 			return "ok";
 		}
 
-		const summaryResult = await navigateWithSummary(ctx, originId, options.showSummaryLoader ?? false);
+		const summaryPrompt = action === "returnAndFixOnly" ? REVIEW_FIX_ONLY_SUMMARY_PROMPT : REVIEW_SUMMARY_PROMPT;
+		const loaderText = action === "returnAndFixOnly"
+			? "Returning with review fix requests..."
+			: "Returning and summarizing review branch...";
+		const summaryResult = await navigateWithSummary(
+			ctx,
+			originId,
+			options.showSummaryLoader ?? false,
+			summaryPrompt,
+			loaderText,
+		);
 		if (summaryResult === null) {
 			ctx.ui.notify("Summarization cancelled. Use /end-review to try again.", "info");
 			return "cancelled";
@@ -1578,9 +1601,13 @@ Instructions:
 			return "ok";
 		}
 
-		pi.sendUserMessage(REVIEW_FIX_FINDINGS_PROMPT, { deliverAs: "followUp" });
+		const followUpPrompt = action === "returnAndFixOnly" ? REVIEW_FIX_REQUESTS_PROMPT : REVIEW_FIX_FINDINGS_PROMPT;
+		pi.sendUserMessage(followUpPrompt, { deliverAs: "followUp" });
 		if (notifySuccess) {
-			ctx.ui.notify("Review complete! Returned and queued a follow-up to fix findings.", "info");
+			const message = action === "returnAndFixOnly"
+				? "Review complete! Returned with fix requests and queued the follow-up."
+				: "Review complete! Returned and queued a follow-up to fix findings.";
+			ctx.ui.notify(message, "info");
 		}
 		return "ok";
 	}
@@ -1601,6 +1628,7 @@ Instructions:
 		try {
 			const choice = await ctx.ui.select("Finish review:", [
 				"Return only",
+				"Return and fix requests only",
 				"Return and fix findings",
 				"Return and summarize",
 			]);
@@ -1611,11 +1639,13 @@ Instructions:
 			}
 
 			const action: EndReviewAction =
-				choice === "Return and fix findings"
-					? "returnAndFix"
-					: choice === "Return and summarize"
-						? "returnAndSummarize"
-						: "returnOnly";
+				choice === "Return and fix requests only"
+					? "returnAndFixOnly"
+					: choice === "Return and fix findings"
+						? "returnAndFix"
+						: choice === "Return and summarize"
+							? "returnAndSummarize"
+							: "returnOnly";
 
 			await executeEndReviewAction(ctx, action, {
 				showSummaryLoader: true,

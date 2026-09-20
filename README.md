@@ -40,4 +40,4 @@ When a review session is active, finish it with:
 /end-review
 ```
 
-You can then return only, return + summarize, or return + queue fixing work.
+You can then return only, return with a compact summary, queue fixing work from that summary, or queue fixing work from a minimal fix-request handoff.

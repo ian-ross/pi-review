@@ -45,8 +45,10 @@ import { promises as fs } from "node:fs";
 // Module-level state means only one review can be active at a time.
 // This is intentional - the UI and /end-review command assume a single active review.
 let reviewOriginId: string | undefined = undefined;
+let activeReviewSessionState: ReviewSessionState | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
+let reviewModel: ModelRef | undefined = undefined;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -56,13 +58,25 @@ const GH_SETUP_INSTRUCTIONS =
 const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
 	"Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.";
 
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+type ModelRef = {
+	provider: string;
+	modelId: string;
+	thinkingLevel?: ThinkingLevel;
+};
+
 type ReviewSessionState = {
 	active: boolean;
 	originId?: string;
+	mainModel?: ModelRef;
+	mainThinkingLevel?: ThinkingLevel;
+	reviewModel?: ModelRef;
 };
 
 type ReviewSettingsState = {
 	customInstructions?: string;
+	reviewModel?: ModelRef;
 };
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
@@ -101,11 +115,13 @@ function applyReviewState(ctx: ExtensionContext) {
 	const state = getReviewState(ctx);
 
 	if (state?.active && state.originId) {
+		activeReviewSessionState = state;
 		reviewOriginId = state.originId;
 		setReviewWidget(ctx, true);
 		return;
 	}
 
+	activeReviewSessionState = undefined;
 	reviewOriginId = undefined;
 	setReviewWidget(ctx, false);
 }
@@ -120,12 +136,27 @@ function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
 
 	return {
 		customInstructions: state?.customInstructions?.trim() || undefined,
+		reviewModel: normalizeModelRef(state?.reviewModel),
 	};
 }
 
 function applyReviewSettings(ctx: ExtensionContext) {
 	const state = getReviewSettings(ctx);
 	reviewCustomInstructions = state.customInstructions?.trim() || undefined;
+	reviewModel = state.reviewModel;
+}
+
+function normalizeModelRef(value: ModelRef | undefined): ModelRef | undefined {
+	if (!value?.provider?.trim() || !value.modelId?.trim()) return undefined;
+	return {
+		provider: value.provider.trim(),
+		modelId: value.modelId.trim(),
+		thinkingLevel: value.thinkingLevel,
+	};
+}
+
+function formatModelRef(model: ModelRef | undefined): string {
+	return model ? `${model.provider}/${model.modelId}` : "current model";
 }
 
 // Review target types (matching Codex's approach)
@@ -559,21 +590,84 @@ const REVIEW_PRESETS = [
 	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
 ] as const;
 
+const SET_REVIEW_MODEL_VALUE = "setReviewModel" as const;
 const TOGGLE_CUSTOM_INSTRUCTIONS_VALUE = "toggleCustomInstructions" as const;
 type ReviewPresetValue =
 	| (typeof REVIEW_PRESETS)[number]["value"]
+	| typeof SET_REVIEW_MODEL_VALUE
 	| typeof TOGGLE_CUSTOM_INSTRUCTIONS_VALUE;
 
 export default function reviewExtension(pi: ExtensionAPI) {
 	function persistReviewSettings() {
 		pi.appendEntry(REVIEW_SETTINGS_TYPE, {
 			customInstructions: reviewCustomInstructions,
+			reviewModel,
 		});
 	}
 
 	function setReviewCustomInstructions(instructions: string | undefined) {
 		reviewCustomInstructions = instructions?.trim() || undefined;
 		persistReviewSettings();
+	}
+
+	function setReviewModel(model: ModelRef | undefined) {
+		reviewModel = normalizeModelRef(model);
+		persistReviewSettings();
+	}
+
+	function getCurrentModelRef(ctx: ExtensionContext): ModelRef | undefined {
+		return ctx.model ? { provider: ctx.model.provider, modelId: ctx.model.id } : undefined;
+	}
+
+	function parseModelSpec(ctx: ExtensionContext, value: string): ModelRef | null {
+		const trimmed = value.trim();
+		if (!trimmed) return null;
+
+		const slashIndex = trimmed.indexOf("/");
+		if (slashIndex > 0 && slashIndex < trimmed.length - 1) {
+			const provider = trimmed.slice(0, slashIndex);
+			const modelId = trimmed.slice(slashIndex + 1);
+			return ctx.modelRegistry.find(provider, modelId) ? { provider, modelId } : null;
+		}
+
+		const matches = ctx.modelRegistry
+			.getAvailable()
+			.filter((model) => model.id === trimmed || model.name === trimmed);
+		return matches.length === 1 ? { provider: matches[0].provider, modelId: matches[0].id } : null;
+	}
+
+	function getSelectableModels(ctx: ExtensionContext): ModelRef[] {
+		return ctx.modelRegistry
+			.getAvailable()
+			.map((model) => ({ provider: model.provider, modelId: model.id }))
+			.sort((a, b) => formatModelRef(a).localeCompare(formatModelRef(b)));
+	}
+
+	async function restoreMainModel(ctx: ExtensionContext, state: ReviewSessionState): Promise<void> {
+		const mainModel = normalizeModelRef(state.mainModel);
+		if (!mainModel) return;
+
+		const model = ctx.modelRegistry.find(mainModel.provider, mainModel.modelId);
+		if (!model) {
+			ctx.ui.notify(
+				`Review complete, but original model ${formatModelRef(mainModel)} is no longer available.`,
+				"warning",
+			);
+			return;
+		}
+
+		const success = await pi.setModel(model);
+		if (!success) {
+			ctx.ui.notify(
+				`Review complete, but original model ${formatModelRef(mainModel)} has no configured auth.`,
+				"warning",
+			);
+			return;
+		}
+
+		if (state.mainThinkingLevel) {
+			pi.setThinkingLevel(state.mainThinkingLevel);
+		}
 	}
 
 	function applyAllReviewState(ctx: ExtensionContext) {
@@ -684,6 +778,118 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return "commit";
 	}
 
+	async function showReviewModelSelector(ctx: ExtensionContext): Promise<void> {
+		const availableModels = getSelectableModels(ctx);
+		if (availableModels.length === 0) {
+			ctx.ui.notify("No models are available for review selection", "error");
+			return;
+		}
+
+		const clearValue = "__clear_review_model__";
+		const items: SelectItem[] = availableModels.map((model) => ({
+			value: formatModelRef(model),
+			label: formatModelRef(model),
+			description: model.thinkingLevel ? `thinking:${model.thinkingLevel}` : "",
+		}));
+		if (reviewModel) {
+			items.unshift({ value: clearValue, label: "Use current model", description: "clear review model" });
+		}
+
+		const result = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+			container.addChild(new Text(theme.fg("accent", theme.bold("Select review model"))));
+
+			const searchInput = new Input();
+			container.addChild(searchInput);
+			container.addChild(new Spacer(1));
+
+			const listContainer = new Container();
+			container.addChild(listContainer);
+			container.addChild(new Text(theme.fg("dim", "Type to filter • enter to select • esc to cancel")));
+			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+			let filteredItems = items;
+			let selectList: SelectList | null = null;
+
+			const updateList = () => {
+				listContainer.clear();
+				if (filteredItems.length === 0) {
+					listContainer.addChild(new Text(theme.fg("warning", "  No matching models")));
+					selectList = null;
+					return;
+				}
+
+				selectList = new SelectList(filteredItems, Math.min(filteredItems.length, 10), {
+					selectedPrefix: (text) => theme.fg("accent", text),
+					selectedText: (text) => theme.fg("accent", text),
+					description: (text) => theme.fg("muted", text),
+					scrollInfo: (text) => theme.fg("dim", text),
+					noMatch: (text) => theme.fg("warning", text),
+				});
+
+				selectList.onSelect = (item) => done(item.value);
+				selectList.onCancel = () => done(null);
+				listContainer.addChild(selectList);
+			};
+
+			const applyFilter = () => {
+				const query = searchInput.getValue();
+				filteredItems = query
+					? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`)
+					: items;
+				updateList();
+			};
+
+			applyFilter();
+
+			return {
+				render(width: number) {
+					return container.render(width);
+				},
+				invalidate() {
+					container.invalidate();
+				},
+				handleInput(data: string) {
+					if (
+						keybindings.matches(data, "tui.select.up") ||
+						keybindings.matches(data, "tui.select.down") ||
+						keybindings.matches(data, "tui.select.confirm") ||
+						keybindings.matches(data, "tui.select.cancel")
+					) {
+						if (selectList) {
+							selectList.handleInput(data);
+						} else if (keybindings.matches(data, "tui.select.cancel")) {
+							done(null);
+						}
+						tui.requestRender();
+						return;
+					}
+
+					searchInput.handleInput(data);
+					applyFilter();
+					tui.requestRender();
+				},
+			};
+		});
+
+		if (!result) return;
+		if (result === clearValue) {
+			setReviewModel(undefined);
+			ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			return;
+		}
+
+		const selected = availableModels.find((model) => formatModelRef(model) === result);
+		if (!selected) {
+			ctx.ui.notify(`Review model not found: ${result}`, "error");
+			return;
+		}
+
+		setReviewModel(selected);
+		ctx.ui.notify(`Review model set to ${formatModelRef(selected)}`, "info");
+	}
+
 	/**
 	 * Show the review preset selector
 	 */
@@ -704,8 +910,15 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			const customInstructionsDescription = reviewCustomInstructions
 				? "(currently set)"
 				: "(applies to all review modes)";
+			const reviewModelLabel = reviewModel ? "Change review model" : "Set review model";
+			const reviewModelDescription = reviewModel ? formatModelRef(reviewModel) : "(uses current model)";
 			const items: SelectItem[] = [
 				...presetItems,
+				{
+					value: SET_REVIEW_MODEL_VALUE,
+					label: reviewModelLabel,
+					description: reviewModelDescription,
+				},
 				{
 					value: TOGGLE_CUSTOM_INSTRUCTIONS_VALUE,
 					label: customInstructionsLabel,
@@ -753,6 +966,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			});
 
 			if (!result) return null;
+
+			if (result === SET_REVIEW_MODEL_VALUE) {
+				await showReviewModelSelector(ctx);
+				continue;
+			}
 
 			if (result === TOGGLE_CUSTOM_INSTRUCTIONS_VALUE) {
 				if (reviewCustomInstructions) {
@@ -1091,6 +1309,21 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
+		const mainModel = getCurrentModelRef(ctx);
+		const mainThinkingLevel = pi.getThinkingLevel() as ThinkingLevel;
+		const requestedReviewModel = useFreshSession ? normalizeModelRef(reviewModel) : undefined;
+		const resolvedReviewModel = requestedReviewModel
+			? ctx.modelRegistry.find(requestedReviewModel.provider, requestedReviewModel.modelId)
+			: undefined;
+		if (requestedReviewModel && !resolvedReviewModel) {
+			ctx.ui.notify(`Review model not found: ${formatModelRef(requestedReviewModel)}`, "error");
+			return false;
+		}
+		if (resolvedReviewModel && !ctx.modelRegistry.hasConfiguredAuth(resolvedReviewModel)) {
+			ctx.ui.notify(`Review model has no configured auth: ${formatModelRef(requestedReviewModel)}`, "error");
+			return false;
+		}
+
 		// Handle fresh session mode
 		if (useFreshSession) {
 			// Store current position (where we'll return to).
@@ -1122,11 +1355,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				try {
 					const result = await ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" });
 					if (result.cancelled) {
+						activeReviewSessionState = undefined;
 						reviewOriginId = undefined;
 						return false;
 					}
 				} catch (error) {
 					// Clean up state if navigation fails
+					activeReviewSessionState = undefined;
 					reviewOriginId = undefined;
 					ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
 					return false;
@@ -1139,11 +1374,31 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			// Restore origin after navigation events (session_tree can reset it)
 			reviewOriginId = lockedOriginId;
 
+			const state: ReviewSessionState = {
+				active: true,
+				originId: lockedOriginId,
+				mainModel,
+				mainThinkingLevel,
+				reviewModel: requestedReviewModel,
+			};
+			activeReviewSessionState = state;
+
 			// Show widget indicating review is active
 			setReviewWidget(ctx, true);
 
 			// Persist review state so tree navigation can restore/reset it
-			pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
+			pi.appendEntry(REVIEW_STATE_TYPE, state);
+
+			if (resolvedReviewModel) {
+				const success = await pi.setModel(resolvedReviewModel);
+				if (!success) {
+					ctx.ui.notify(`Review model has no configured auth: ${formatModelRef(requestedReviewModel)}`, "error");
+					return false;
+				}
+				if (requestedReviewModel?.thinkingLevel) {
+					pi.setThinkingLevel(requestedReviewModel.thinkingLevel);
+				}
+			}
 		}
 
 		const prompt = await buildReviewPrompt(pi, target);
@@ -1166,7 +1421,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		}
 
 		const modeHint = useFreshSession ? " (fresh session)" : "";
-		ctx.ui.notify(`Starting review: ${hint}${modeHint}`, "info");
+		const modelHint = resolvedReviewModel ? ` with ${formatModelRef(requestedReviewModel)}` : "";
+		ctx.ui.notify(`Starting review: ${hint}${modeHint}${modelHint}`, "info");
 
 		// Send as a user message that triggers a turn
 		pi.sendUserMessage(fullPrompt);
@@ -1180,6 +1436,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	type ParsedReviewArgs = {
 		target: ReviewTarget | { type: "pr"; ref: string } | null;
 		extraInstruction?: string;
+		configAction?: { type: "model"; value?: string };
 		error?: string;
 	};
 
@@ -1262,6 +1519,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		const subcommand = parts[0]?.toLowerCase();
 
 		switch (subcommand) {
+			case "model":
+				return {
+					target: null,
+					configAction: { type: "model", value: parts.slice(1).join(" ") || undefined },
+					extraInstruction,
+				};
+
 			case "uncommitted":
 				return { target: { type: "uncommitted" }, extraInstruction };
 
@@ -1303,6 +1567,29 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return await resolvePullRequestTarget(ctx, ref);
 	}
 
+	async function handleReviewModelConfig(ctx: ExtensionContext, value: string | undefined): Promise<void> {
+		const trimmed = value?.trim();
+		if (!trimmed) {
+			await showReviewModelSelector(ctx);
+			return;
+		}
+
+		if (["clear", "none", "current"].includes(trimmed.toLowerCase())) {
+			setReviewModel(undefined);
+			ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			return;
+		}
+
+		const parsed = parseModelSpec(ctx, trimmed);
+		if (!parsed) {
+			ctx.ui.notify(`Review model not found or ambiguous: ${trimmed}`, "error");
+			return;
+		}
+
+		setReviewModel(parsed);
+		ctx.ui.notify(`Review model set to ${formatModelRef(parsed)}`, "info");
+	}
+
 	// Register the /review command
 	pi.registerCommand("review", {
 		description: "Review code changes (PR, uncommitted, branch, commit, or folder)",
@@ -1335,6 +1622,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				return;
 			}
 			extraInstruction = parsed.extraInstruction?.trim() || undefined;
+			if (parsed.configAction?.type === "model") {
+				await handleReviewModelConfig(ctx, parsed.configAction.value);
+				return;
+			}
 
 			if (parsed.target) {
 				if (parsed.target.type === "pr") {
@@ -1468,15 +1759,16 @@ If there are no fix requests, say so and stop. Otherwise fix them in priority or
 		notifySuccess?: boolean;
 	};
 
-	function getActiveReviewOrigin(ctx: ExtensionContext): string | undefined {
-		if (reviewOriginId) {
-			return reviewOriginId;
+	function getActiveReviewSession(ctx: ExtensionContext): ReviewSessionState | undefined {
+		if (activeReviewSessionState?.active && activeReviewSessionState.originId) {
+			return activeReviewSessionState;
 		}
 
 		const state = getReviewState(ctx);
 		if (state?.active && state.originId) {
+			activeReviewSessionState = state;
 			reviewOriginId = state.originId;
-			return reviewOriginId;
+			return state;
 		}
 
 		if (state?.active) {
@@ -1490,6 +1782,7 @@ If there are no fix requests, say so and stop. Otherwise fix them in priority or
 
 	function clearReviewState(ctx: ExtensionContext) {
 		setReviewWidget(ctx, false);
+		activeReviewSessionState = undefined;
 		reviewOriginId = undefined;
 		pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
 	}
@@ -1534,7 +1827,8 @@ If there are no fix requests, say so and stop. Otherwise fix them in priority or
 		action: EndReviewAction,
 		options: EndReviewActionOptions = {},
 	): Promise<EndReviewActionResult> {
-		const originId = getActiveReviewOrigin(ctx);
+		const activeReview = getActiveReviewSession(ctx);
+		const originId = activeReview?.originId;
 		if (!originId) {
 			if (!getReviewState(ctx)?.active) {
 				ctx.ui.notify("Not in a review branch (use /review first, or review was started in current session mode)", "info");
@@ -1556,6 +1850,7 @@ If there are no fix requests, say so and stop. Otherwise fix them in priority or
 				return "error";
 			}
 
+			await restoreMainModel(ctx, activeReview);
 			clearReviewState(ctx);
 			if (notifySuccess) {
 				ctx.ui.notify("Review complete! Returned to original position.", "info");
@@ -1589,6 +1884,7 @@ If there are no fix requests, say so and stop. Otherwise fix them in priority or
 			return "cancelled";
 		}
 
+		await restoreMainModel(ctx, activeReview);
 		clearReviewState(ctx);
 
 		if (action === "returnAndSummarize") {

@@ -38,10 +38,10 @@ It also supports custom shared instructions that are loaded from `REVIEW_GUIDELI
 ```
 
 `/review model` opens a selector for the model used on review branches. pi-review
-stores that choice in the global Pi config directory, so it survives new sessions
-and restarts. It saves the current model before starting the review, switches to
-the configured review model on the review branch, then restores the saved model
-before returning or queuing fix work.
+stores that choice in the project's `.pi/pi-review.json`, so it survives new
+sessions and restarts for that project. It saves the current model before
+starting the review, switches to the configured review model on the review
+branch, then restores the saved model before returning or queuing fix work.
 
 When a review session is active, finish it with:
 

@@ -28,7 +28,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
@@ -49,12 +49,14 @@ let activeReviewSessionState: ReviewSessionState | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
 let reviewModel: ModelRef | undefined = undefined;
+let persistentReviewConfigPath: string | undefined = undefined;
 let persistentReviewConfigExists = false;
 let persistentReviewModel: ModelRef | undefined = undefined;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
 const REVIEW_SETTINGS_TYPE = "review-settings";
+const PROJECT_CONFIG_DIR_NAME = ".pi";
 const REVIEW_CONFIG_FILE = "pi-review.json";
 const GH_SETUP_INSTRUCTIONS =
 	"Install GitHub CLI (`gh`) from https://cli.github.com/ (macOS: `brew install gh`), then sign in with `gh auth login` and verify with `gh auth status`.";
@@ -129,7 +131,7 @@ function applyReviewState(ctx: ExtensionContext) {
 	setReviewWidget(ctx, false);
 }
 
-function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
+function getSessionReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
 	let state: ReviewSettingsState | undefined;
 	for (const entry of ctx.sessionManager.getEntries()) {
 		if (entry.type === "custom" && entry.customType === REVIEW_SETTINGS_TYPE) {
@@ -137,13 +139,18 @@ function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
 		}
 	}
 
-	const legacySessionReviewModel = normalizeModelRef(state?.reviewModel);
-
 	return {
 		customInstructions: state?.customInstructions?.trim() || undefined,
-		reviewModel: persistentReviewConfigExists
-			? persistentReviewModel
-			: legacySessionReviewModel,
+		reviewModel: normalizeModelRef(state?.reviewModel),
+	};
+}
+
+function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
+	const state = getSessionReviewSettings(ctx);
+
+	return {
+		customInstructions: state.customInstructions,
+		reviewModel: persistentReviewConfigExists ? persistentReviewModel : state.reviewModel,
 	};
 }
 
@@ -188,12 +195,27 @@ type PersistentReviewConfig = {
 };
 
 type PersistentReviewConfigLoad = {
+	path: string;
 	exists: boolean;
 	config: PersistentReviewConfig;
 };
 
-function getPersistentReviewConfigPath(): string {
-	return path.join(getAgentDir(), REVIEW_CONFIG_FILE);
+async function getPersistentReviewConfigPath(cwd: string): Promise<string> {
+	let currentDir = path.resolve(cwd);
+
+	while (true) {
+		const configDir = path.join(currentDir, PROJECT_CONFIG_DIR_NAME);
+		const stats = await fs.stat(configDir).catch(() => null);
+		if (stats?.isDirectory()) {
+			return path.join(configDir, REVIEW_CONFIG_FILE);
+		}
+
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) {
+			return path.join(path.resolve(cwd), PROJECT_CONFIG_DIR_NAME, REVIEW_CONFIG_FILE);
+		}
+		currentDir = parentDir;
+	}
 }
 
 function parsePersistentReviewConfig(value: unknown): PersistentReviewConfig {
@@ -202,20 +224,20 @@ function parsePersistentReviewConfig(value: unknown): PersistentReviewConfig {
 	return { reviewModel: normalizeModelRef(record.reviewModel) };
 }
 
-async function loadPersistentReviewConfig(): Promise<PersistentReviewConfigLoad> {
+async function loadPersistentReviewConfig(cwd: string): Promise<PersistentReviewConfigLoad> {
+	const configPath = await getPersistentReviewConfigPath(cwd);
 	try {
-		const content = await fs.readFile(getPersistentReviewConfigPath(), "utf8");
-		return { exists: true, config: parsePersistentReviewConfig(JSON.parse(content) as unknown) };
+		const content = await fs.readFile(configPath, "utf8");
+		return { path: configPath, exists: true, config: parsePersistentReviewConfig(JSON.parse(content) as unknown) };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			return { exists: false, config: {} };
+			return { path: configPath, exists: false, config: {} };
 		}
-		return { exists: true, config: {} };
+		return { path: configPath, exists: true, config: {} };
 	}
 }
 
-async function savePersistentReviewConfig(config: PersistentReviewConfig): Promise<void> {
-	const configPath = getPersistentReviewConfigPath();
+async function savePersistentReviewConfig(configPath: string, config: PersistentReviewConfig): Promise<void> {
 	const normalizedReviewModel = normalizeModelRef(config.reviewModel);
 	const data: { version: number; reviewModel?: ModelRef } = { version: 1 };
 	if (normalizedReviewModel) {
@@ -229,6 +251,25 @@ async function savePersistentReviewConfig(config: PersistentReviewConfig): Promi
 		mode: 0o600,
 	});
 	await fs.rename(tempPath, configPath);
+}
+
+async function loadReviewConfigForContext(ctx: ExtensionContext) {
+	const persistentConfig = await loadPersistentReviewConfig(ctx.cwd);
+	persistentReviewConfigPath = persistentConfig.path;
+	persistentReviewConfigExists = persistentConfig.exists;
+	persistentReviewModel = persistentConfig.config.reviewModel;
+
+	const legacySessionReviewModel = getSessionReviewSettings(ctx).reviewModel;
+	if (!persistentConfig.exists && legacySessionReviewModel) {
+		try {
+			await savePersistentReviewConfig(persistentConfig.path, { reviewModel: legacySessionReviewModel });
+			persistentReviewConfigExists = true;
+			persistentReviewModel = legacySessionReviewModel;
+		} catch {
+			// Keep using the session entry for this run. The next explicit /review model
+			// command will report save failures to the user.
+		}
+	}
 }
 
 // Review target types (matching Codex's approach)
@@ -382,7 +423,7 @@ async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> 
 	let currentDir = path.resolve(cwd);
 
 	while (true) {
-		const piDir = path.join(currentDir, ".pi");
+		const piDir = path.join(currentDir, PROJECT_CONFIG_DIR_NAME);
 		const guidelinesPath = path.join(currentDir, "REVIEW_GUIDELINES.md");
 
 		const piStats = await fs.stat(piDir).catch(() => null);
@@ -669,12 +710,7 @@ type ReviewPresetValue =
 	| typeof SET_REVIEW_MODEL_VALUE
 	| typeof TOGGLE_CUSTOM_INSTRUCTIONS_VALUE;
 
-export default async function reviewExtension(pi: ExtensionAPI) {
-	const persistentConfig = await loadPersistentReviewConfig();
-	persistentReviewConfigExists = persistentConfig.exists;
-	persistentReviewModel = persistentConfig.config.reviewModel;
-	reviewModel = persistentReviewModel;
-
+export default function reviewExtension(pi: ExtensionAPI) {
 	function persistReviewSettings() {
 		pi.appendEntry(REVIEW_SETTINGS_TYPE, {
 			customInstructions: reviewCustomInstructions,
@@ -687,19 +723,27 @@ export default async function reviewExtension(pi: ExtensionAPI) {
 	}
 
 	async function setReviewModel(ctx: ExtensionContext, model: ModelRef | undefined): Promise<boolean> {
+		if (!persistentReviewConfigPath) {
+			await loadReviewConfigForContext(ctx);
+		}
+
+		const configPath = persistentReviewConfigPath ?? (await getPersistentReviewConfigPath(ctx.cwd));
+		const previousConfigPath = persistentReviewConfigPath;
 		const previousConfigExists = persistentReviewConfigExists;
 		const previousPersistentReviewModel = persistentReviewModel;
 		const previousReviewModel = reviewModel;
 		const nextReviewModel = normalizeModelRef(model);
 
+		persistentReviewConfigPath = configPath;
 		persistentReviewConfigExists = true;
 		persistentReviewModel = nextReviewModel;
 		reviewModel = nextReviewModel;
 
 		try {
-			await savePersistentReviewConfig({ reviewModel: nextReviewModel });
+			await savePersistentReviewConfig(configPath, { reviewModel: nextReviewModel });
 			return true;
 		} catch (error) {
+			persistentReviewConfigPath = previousConfigPath;
 			persistentReviewConfigExists = previousConfigExists;
 			persistentReviewModel = previousPersistentReviewModel;
 			reviewModel = previousReviewModel;
@@ -764,7 +808,8 @@ export default async function reviewExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function applyAllReviewState(ctx: ExtensionContext) {
+	async function applyAllReviewState(ctx: ExtensionContext) {
+		await loadReviewConfigForContext(ctx);
 		applyReviewSettings(ctx);
 		applyReviewState(ctx);
 	}
@@ -843,13 +888,13 @@ export default async function reviewExtension(pi: ExtensionAPI) {
 		};
 	}
 
-	pi.on("session_start", (_event, ctx) => {
-		applyAllReviewState(ctx);
+	pi.on("session_start", async (_event, ctx) => {
+		await applyAllReviewState(ctx);
 	});
 
 
-	pi.on("session_tree", (_event, ctx) => {
-		applyAllReviewState(ctx);
+	pi.on("session_tree", async (_event, ctx) => {
+		await applyAllReviewState(ctx);
 	});
 
 	/**

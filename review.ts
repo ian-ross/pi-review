@@ -28,7 +28,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
@@ -49,10 +49,13 @@ let activeReviewSessionState: ReviewSessionState | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
 let reviewModel: ModelRef | undefined = undefined;
+let persistentReviewConfigExists = false;
+let persistentReviewModel: ModelRef | undefined = undefined;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
 const REVIEW_SETTINGS_TYPE = "review-settings";
+const REVIEW_CONFIG_FILE = "pi-review.json";
 const GH_SETUP_INSTRUCTIONS =
 	"Install GitHub CLI (`gh`) from https://cli.github.com/ (macOS: `brew install gh`), then sign in with `gh auth login` and verify with `gh auth status`.";
 const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
@@ -134,9 +137,13 @@ function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
 		}
 	}
 
+	const legacySessionReviewModel = normalizeModelRef(state?.reviewModel);
+
 	return {
 		customInstructions: state?.customInstructions?.trim() || undefined,
-		reviewModel: normalizeModelRef(state?.reviewModel),
+		reviewModel: persistentReviewConfigExists
+			? persistentReviewModel
+			: legacySessionReviewModel,
 	};
 }
 
@@ -146,17 +153,82 @@ function applyReviewSettings(ctx: ExtensionContext) {
 	reviewModel = state.reviewModel;
 }
 
-function normalizeModelRef(value: ModelRef | undefined): ModelRef | undefined {
-	if (!value?.provider?.trim() || !value.modelId?.trim()) return undefined;
+function normalizeModelRef(value: unknown): ModelRef | undefined {
+	if (!value || typeof value !== "object") return undefined;
+
+	const record = value as { provider?: unknown; modelId?: unknown; thinkingLevel?: unknown };
+	if (typeof record.provider !== "string" || typeof record.modelId !== "string") return undefined;
+
+	const provider = record.provider.trim();
+	const modelId = record.modelId.trim();
+	if (!provider || !modelId) return undefined;
+
 	return {
-		provider: value.provider.trim(),
-		modelId: value.modelId.trim(),
-		thinkingLevel: value.thinkingLevel,
+		provider,
+		modelId,
+		thinkingLevel: isThinkingLevel(record.thinkingLevel) ? record.thinkingLevel : undefined,
 	};
+}
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return value === "off" ||
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh";
 }
 
 function formatModelRef(model: ModelRef | undefined): string {
 	return model ? `${model.provider}/${model.modelId}` : "current model";
+}
+
+type PersistentReviewConfig = {
+	reviewModel?: ModelRef;
+};
+
+type PersistentReviewConfigLoad = {
+	exists: boolean;
+	config: PersistentReviewConfig;
+};
+
+function getPersistentReviewConfigPath(): string {
+	return path.join(getAgentDir(), REVIEW_CONFIG_FILE);
+}
+
+function parsePersistentReviewConfig(value: unknown): PersistentReviewConfig {
+	if (!value || typeof value !== "object") return {};
+	const record = value as { reviewModel?: unknown };
+	return { reviewModel: normalizeModelRef(record.reviewModel) };
+}
+
+async function loadPersistentReviewConfig(): Promise<PersistentReviewConfigLoad> {
+	try {
+		const content = await fs.readFile(getPersistentReviewConfigPath(), "utf8");
+		return { exists: true, config: parsePersistentReviewConfig(JSON.parse(content) as unknown) };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { exists: false, config: {} };
+		}
+		return { exists: true, config: {} };
+	}
+}
+
+async function savePersistentReviewConfig(config: PersistentReviewConfig): Promise<void> {
+	const configPath = getPersistentReviewConfigPath();
+	const normalizedReviewModel = normalizeModelRef(config.reviewModel);
+	const data: { version: number; reviewModel?: ModelRef } = { version: 1 };
+	if (normalizedReviewModel) {
+		data.reviewModel = normalizedReviewModel;
+	}
+
+	await fs.mkdir(path.dirname(configPath), { recursive: true });
+	const tempPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+	await fs.writeFile(tempPath, JSON.stringify(data, null, "\t") + "\n", {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	await fs.rename(tempPath, configPath);
 }
 
 // Review target types (matching Codex's approach)
@@ -597,11 +669,15 @@ type ReviewPresetValue =
 	| typeof SET_REVIEW_MODEL_VALUE
 	| typeof TOGGLE_CUSTOM_INSTRUCTIONS_VALUE;
 
-export default function reviewExtension(pi: ExtensionAPI) {
+export default async function reviewExtension(pi: ExtensionAPI) {
+	const persistentConfig = await loadPersistentReviewConfig();
+	persistentReviewConfigExists = persistentConfig.exists;
+	persistentReviewModel = persistentConfig.config.reviewModel;
+	reviewModel = persistentReviewModel;
+
 	function persistReviewSettings() {
 		pi.appendEntry(REVIEW_SETTINGS_TYPE, {
 			customInstructions: reviewCustomInstructions,
-			reviewModel,
 		});
 	}
 
@@ -610,9 +686,27 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		persistReviewSettings();
 	}
 
-	function setReviewModel(model: ModelRef | undefined) {
-		reviewModel = normalizeModelRef(model);
-		persistReviewSettings();
+	async function setReviewModel(ctx: ExtensionContext, model: ModelRef | undefined): Promise<boolean> {
+		const previousConfigExists = persistentReviewConfigExists;
+		const previousPersistentReviewModel = persistentReviewModel;
+		const previousReviewModel = reviewModel;
+		const nextReviewModel = normalizeModelRef(model);
+
+		persistentReviewConfigExists = true;
+		persistentReviewModel = nextReviewModel;
+		reviewModel = nextReviewModel;
+
+		try {
+			await savePersistentReviewConfig({ reviewModel: nextReviewModel });
+			return true;
+		} catch (error) {
+			persistentReviewConfigExists = previousConfigExists;
+			persistentReviewModel = previousPersistentReviewModel;
+			reviewModel = previousReviewModel;
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Failed to save review model config: ${message}`, "error");
+			return false;
+		}
 	}
 
 	function getCurrentModelRef(ctx: ExtensionContext): ModelRef | undefined {
@@ -875,8 +969,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 		if (!result) return;
 		if (result === clearValue) {
-			setReviewModel(undefined);
-			ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			if (await setReviewModel(ctx, undefined)) {
+				ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			}
 			return;
 		}
 
@@ -886,8 +981,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		setReviewModel(selected);
-		ctx.ui.notify(`Review model set to ${formatModelRef(selected)}`, "info");
+		if (await setReviewModel(ctx, selected)) {
+			ctx.ui.notify(`Review model set to ${formatModelRef(selected)}`, "info");
+		}
 	}
 
 	/**
@@ -1575,8 +1671,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		}
 
 		if (["clear", "none", "current"].includes(trimmed.toLowerCase())) {
-			setReviewModel(undefined);
-			ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			if (await setReviewModel(ctx, undefined)) {
+				ctx.ui.notify("Review model cleared; reviews will use the current model", "info");
+			}
 			return;
 		}
 
@@ -1586,8 +1683,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		setReviewModel(parsed);
-		ctx.ui.notify(`Review model set to ${formatModelRef(parsed)}`, "info");
+		if (await setReviewModel(ctx, parsed)) {
+			ctx.ui.notify(`Review model set to ${formatModelRef(parsed)}`, "info");
+		}
 	}
 
 	// Register the /review command
